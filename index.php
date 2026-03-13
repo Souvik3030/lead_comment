@@ -4,7 +4,9 @@
 // CONFIG — update this to your Bitrix24 webhook URL
 // ============================================================
 define('BITRIX_WEBHOOK_URL', 'https://13.234.18.177.sslip.io/rest/1/c549rd6ic2gw5e3s/');
-define('LOG_FILE', __DIR__ . '/timeline_to_comment.log');
+define('LOG_FILE',  __DIR__ . '/comments_sync.log');
+define('LOCK_DIR',  __DIR__ . '/locks/');
+define('LOCK_TTL',  5); // seconds before lock expires
 
 // ============================================================
 // HELPERS
@@ -54,7 +56,7 @@ function callBitrix(string $method, array $params = []): array
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
     $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    // curl_close($ch);
+    curl_close($ch);
 
     if ($curlError) {
         logEvent('BITRIX API ERROR', 'cURL error on ' . $method, [
@@ -73,6 +75,38 @@ function callBitrix(string $method, array $params = []): array
     return $decoded;
 }
 
+function isLocked(string $leadId, string $direction): bool
+{
+    if (!is_dir(LOCK_DIR)) {
+        mkdir(LOCK_DIR, 0755, true);
+    }
+    $lockFile = LOCK_DIR . 'lead_' . $leadId . '_' . $direction . '.lock';
+    if (file_exists($lockFile) && (time() - filemtime($lockFile)) < LOCK_TTL) {
+        logEvent('LOCK CHECK', 'LOCKED — skipping to prevent infinite loop', [
+            'lead_id'   => $leadId,
+            'direction' => $direction,
+            'lock_file' => $lockFile,
+            'age_secs'  => time() - filemtime($lockFile),
+        ]);
+        return true;
+    }
+    return false;
+}
+
+function setLock(string $leadId, string $direction): void
+{
+    if (!is_dir(LOCK_DIR)) {
+        mkdir(LOCK_DIR, 0755, true);
+    }
+    $lockFile = LOCK_DIR . 'lead_' . $leadId . '_' . $direction . '.lock';
+    file_put_contents($lockFile, time());
+    logEvent('LOCK SET', 'Lock created — will expire in ' . LOCK_TTL . ' seconds', [
+        'lead_id'   => $leadId,
+        'direction' => $direction,
+        'lock_file' => $lockFile,
+    ]);
+}
+
 // ============================================================
 // ENTRY POINT
 // ============================================================
@@ -86,7 +120,7 @@ logEvent('BOOT', 'Script started', [
 ]);
 
 // ============================================================
-// STEP 1: Validate POST request
+// STEP 1: Validate POST
 // ============================================================
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     header('HTTP/1.1 405 Method Not Allowed');
@@ -120,141 +154,216 @@ if (empty($data)) {
 }
 
 // ============================================================
-// STEP 3: Validate event type
+// STEP 3: Validate event
 // ============================================================
-$event = $data['event'] ?? null;
+$event         = $data['event'] ?? null;
+$allowedEvents = ['ONCRMLEADADD', 'ONCRMLEADUPDATE', 'ONCRMTIMELINECOMMENTADD'];
 
 logEvent('STEP 3 — EVENT CHECK', 'Checking event type', [
-    'received_event'  => $event,
-    'expected_event'  => 'ONCRMTIMELINECOMMENTADD',
+    'received_event' => $event,
+    'allowed_events' => $allowedEvents,
 ]);
 
-if ($event !== 'ONCRMTIMELINECOMMENTADD') {
-    logEvent('STEP 3 — EVENT CHECK', 'IGNORED — not a timeline comment event', [
-        'event' => $event,
-    ]);
+if (!$event || !in_array($event, $allowedEvents)) {
+    logEvent('STEP 3 — EVENT CHECK', 'IGNORED — event not in allowed list', ['event' => $event]);
     respond('ignored', 'Unrecognized event: ' . ($event ?? 'none'));
 }
 
-logEvent('STEP 3 — EVENT CHECK', 'Passed — ONCRMTIMELINECOMMENTADD received');
+logEvent('STEP 3 — EVENT CHECK', 'Passed — valid event', ['event' => $event]);
 
 // ============================================================
-// STEP 4: Extract Comment ID
+// DIRECTION A: Lead COMMENTS field → Timeline comment
+// Events: ONCRMLEADADD, ONCRMLEADUPDATE
 // ============================================================
-$commentId = $data['data']['FIELDS']['ID'] ?? null;
+if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 
-logEvent('STEP 4 — COMMENT ID', 'Extracting Comment ID from payload', [
-    'data[data]'   => $data['data'] ?? null,
-    'extracted_id' => $commentId,
-]);
+    logEvent('DIRECTION A', 'Lead COMMENTS → Timeline triggered', ['event' => $event]);
 
-if (!$commentId) {
-    logEvent('STEP 4 — COMMENT ID', 'FAILED — Comment ID missing');
-    respond('error', 'Comment ID missing');
+    // A1: Get Lead ID
+    $leadId = $data['data']['FIELDS']['ID'] ?? null;
+    logEvent('DIRECTION A — STEP 1', 'Extracting Lead ID', [
+        'data[data]'   => $data['data'] ?? null,
+        'extracted_id' => $leadId,
+    ]);
+
+    if (!$leadId) {
+        respond('error', 'Lead ID missing');
+    }
+
+    // A2: Loop guard — skip if triggered by our own timeline→comment sync
+    if (isLocked($leadId, 'timeline_to_comment')) {
+        respond('ignored', 'Loop guard — skipping, triggered by our own timeline sync');
+    }
+
+    // A3: Fetch Lead
+    logEvent('DIRECTION A — STEP 2', 'Fetching lead', ['lead_id' => $leadId]);
+    $leadResult = callBitrix('crm.lead.get', ['id' => $leadId]);
+
+    if (empty($leadResult['result'])) {
+        logEvent('DIRECTION A — STEP 2', 'FAILED — Lead not found', $leadResult);
+        respond('error', 'Lead not found');
+    }
+
+    $newComment = trim($leadResult['result']['COMMENTS'] ?? '');
+    logEvent('DIRECTION A — STEP 3', 'COMMENTS field value', [
+        'value'    => $newComment,
+        'is_empty' => $newComment === '',
+    ]);
+
+    // A4: Skip if empty
+    if (!$newComment) {
+        respond('ignored', 'COMMENTS field is empty — nothing to sync');
+    }
+
+    // A5: Fetch latest timeline comment to check for duplicate
+    $timelineResult      = callBitrix('crm.timeline.comment.list', [
+        'filter[ENTITY_TYPE]' => 'lead',
+        'filter[ENTITY_ID]'   => $leadId,
+        'order[ID]'           => 'DESC',
+        'limit'               => 1,
+    ]);
+    $lastTimelineComment = trim($timelineResult['result'][0]['COMMENT'] ?? '');
+
+    logEvent('DIRECTION A — STEP 4', 'Duplicate check', [
+        'last_timeline_comment' => $lastTimelineComment,
+        'new_comment'           => $newComment,
+        'is_duplicate'          => $lastTimelineComment === $newComment,
+    ]);
+
+    if ($lastTimelineComment === $newComment) {
+        respond('ignored', 'Timeline already has this comment — skipping');
+    }
+
+    // A6: Set lock before posting to timeline (prevents Direction B from looping back)
+    setLock($leadId, 'comment_to_timeline');
+
+    // A7: Post to timeline
+    logEvent('DIRECTION A — STEP 5', 'Posting to timeline', [
+        'lead_id' => $leadId,
+        'comment' => $newComment,
+    ]);
+
+    $addResult = callBitrix('crm.timeline.comment.add', [
+        'fields[ENTITY_TYPE]' => 'lead',
+        'fields[ENTITY_ID]'   => $leadId,
+        'fields[COMMENT]'     => $newComment,
+    ]);
+
+    if (!empty($addResult['result'])) {
+        logEvent('DIRECTION A — STEP 5', 'SUCCESS — Timeline comment created', [
+            'lead_id'      => $leadId,
+            'comment'      => $newComment,
+            'new_entry_id' => $addResult['result'],
+        ]);
+        respond('success', 'Timeline comment created successfully');
+    } else {
+        logEvent('DIRECTION A — STEP 5', 'FAILED — Could not create timeline comment', $addResult);
+        respond('error', 'Failed to create timeline comment');
+    }
 }
 
-logEvent('STEP 4 — COMMENT ID', 'Passed — Comment ID found', ['comment_id' => $commentId]);
-
 // ============================================================
-// STEP 5: Fetch comment data from Bitrix24
+// DIRECTION B: Timeline comment → Lead COMMENTS field
+// Event: ONCRMTIMELINECOMMENTADD
 // ============================================================
-logEvent('STEP 5 — FETCH COMMENT', 'Fetching comment from Bitrix24', ['comment_id' => $commentId]);
+if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
-$commentResult = callBitrix('crm.timeline.comment.get', ['id' => $commentId]);
+    logEvent('DIRECTION B', 'Timeline → Lead COMMENTS triggered', ['event' => $event]);
 
-if (empty($commentResult['result'])) {
-    logEvent('STEP 5 — FETCH COMMENT', 'FAILED — Comment not found or API error', $commentResult);
-    respond('error', 'Comment not found');
-}
+    // B1: Get Comment ID
+    $commentId = $data['data']['FIELDS']['ID'] ?? null;
+    logEvent('DIRECTION B — STEP 1', 'Extracting Comment ID', [
+        'data[data]'   => $data['data'] ?? null,
+        'extracted_id' => $commentId,
+    ]);
 
-$commentData = $commentResult['result'];
-$commentText = trim($commentData['COMMENT'] ?? '');
-$entityType  = strtolower($commentData['ENTITY_TYPE'] ?? '');
-$entityId    = (int)($commentData['ENTITY_ID'] ?? 0);
+    if (!$commentId) {
+        respond('error', 'Comment ID missing');
+    }
 
-logEvent('STEP 5 — FETCH COMMENT', 'Comment data extracted', [
-    'comment_text' => $commentText,
-    'entity_type'  => $entityType,
-    'entity_id'    => $entityId,
-]);
+    // B2: Fetch comment
+    logEvent('DIRECTION B — STEP 2', 'Fetching comment from Bitrix24', ['comment_id' => $commentId]);
+    $commentResult = callBitrix('crm.timeline.comment.get', ['id' => $commentId]);
 
-// ============================================================
-// STEP 6: Validate — must be a lead comment with text
-// ============================================================
-logEvent('STEP 6 — VALIDATION', 'Validating entity and comment text', [
-    'entity_type'       => $entityType,
-    'entity_id'         => $entityId,
-    'comment_not_empty' => !empty($commentText),
-]);
+    if (empty($commentResult['result'])) {
+        logEvent('DIRECTION B — STEP 2', 'FAILED — Comment not found', $commentResult);
+        respond('error', 'Comment not found');
+    }
 
-if ($entityType !== 'lead') {
-    logEvent('STEP 6 — VALIDATION', 'IGNORED — entity is not a lead', ['entity_type' => $entityType]);
-    respond('ignored', 'Entity is not a lead');
-}
+    $commentData = $commentResult['result'];
+    $commentText = trim($commentData['COMMENT'] ?? '');
+    $entityType  = strtolower($commentData['ENTITY_TYPE'] ?? '');
+    $entityId    = (int)($commentData['ENTITY_ID'] ?? 0);
 
-if (!$entityId) {
-    logEvent('STEP 6 — VALIDATION', 'FAILED — Entity ID is missing or zero');
-    respond('error', 'Entity ID missing');
-}
+    logEvent('DIRECTION B — STEP 3', 'Comment data extracted', [
+        'comment_text' => $commentText,
+        'entity_type'  => $entityType,
+        'entity_id'    => $entityId,
+    ]);
 
-if (!$commentText) {
-    logEvent('STEP 6 — VALIDATION', 'IGNORED — Comment text is empty');
-    respond('ignored', 'Comment text is empty');
-}
+    // B3: Validate
+    if ($entityType !== 'lead') {
+        respond('ignored', 'Entity is not a lead — skipping');
+    }
+    if (!$entityId) {
+        respond('error', 'Entity ID missing');
+    }
+    if (!$commentText) {
+        respond('ignored', 'Comment text is empty');
+    }
 
-logEvent('STEP 6 — VALIDATION', 'Passed — valid lead comment');
+    logEvent('DIRECTION B — STEP 3', 'Validation passed — valid lead comment');
 
-// ============================================================
-// STEP 7: Fetch current Lead to read existing COMMENTS field
-// ============================================================
-logEvent('STEP 7 — FETCH LEAD', 'Fetching lead data', ['lead_id' => $entityId]);
+    // B4: Loop guard — skip if triggered by our own comment→timeline sync
+    if (isLocked($entityId, 'comment_to_timeline')) {
+        respond('ignored', 'Loop guard — skipping, triggered by our own COMMENTS sync');
+    }
 
-$leadResult = callBitrix('crm.lead.get', ['id' => $entityId]);
+    // B5: Fetch current lead COMMENTS
+    logEvent('DIRECTION B — STEP 4', 'Fetching lead to read COMMENTS field', ['lead_id' => $entityId]);
+    $leadResult = callBitrix('crm.lead.get', ['id' => $entityId]);
 
-if (empty($leadResult['result'])) {
-    logEvent('STEP 7 — FETCH LEAD', 'FAILED — Lead not found', $leadResult);
-    respond('error', 'Lead not found');
-}
+    if (empty($leadResult['result'])) {
+        logEvent('DIRECTION B — STEP 4', 'FAILED — Lead not found', $leadResult);
+        respond('error', 'Lead not found');
+    }
 
-$existingComment = trim($leadResult['result']['COMMENTS'] ?? '');
+    $existingComment = trim($leadResult['result']['COMMENTS'] ?? '');
+    logEvent('DIRECTION B — STEP 5', 'Existing COMMENTS field', [
+        'existing_comment' => $existingComment,
+        'new_comment'      => $commentText,
+        'is_same'          => $existingComment === $commentText,
+    ]);
 
-logEvent('STEP 7 — FETCH LEAD', 'Current COMMENTS field value', [
-    'existing_comment' => $existingComment,
-    'is_empty'         => $existingComment === '',
-]);
+    // B6: Skip if already same
+    if ($existingComment === $commentText) {
+        respond('ignored', 'COMMENTS already matches timeline comment — skipping');
+    }
 
-// ============================================================
-// STEP 8: Skip if COMMENTS already matches the timeline comment
-// ============================================================
-if ($existingComment === $commentText) {
-    logEvent('STEP 8 — DUPLICATE CHECK', 'IGNORED — COMMENTS already matches timeline comment');
-    respond('ignored', 'COMMENTS already up to date');
-}
+    // B7: Set lock before updating COMMENTS (prevents Direction A from looping back)
+    setLock($entityId, 'timeline_to_comment');
 
-logEvent('STEP 8 — DUPLICATE CHECK', 'Passed — comment is new, proceeding to update');
-
-// ============================================================
-// STEP 9: Update Lead COMMENTS field
-// ============================================================
-logEvent('STEP 9 — UPDATE LEAD', 'Updating lead COMMENTS field', [
-    'lead_id'     => $entityId,
-    'new_comment' => $commentText,
-]);
-
-$updateResult = callBitrix('crm.lead.update', [
-    'id'               => $entityId,
-    'fields[COMMENTS]' => $commentText,
-]);
-
-logEvent('STEP 9 — UPDATE LEAD', 'Update API result', $updateResult);
-
-if (!isset($updateResult['error'])) {
-    logEvent('STEP 9 — UPDATE LEAD', 'SUCCESS — Lead COMMENTS field updated', [
+    // B8: Update COMMENTS field
+    logEvent('DIRECTION B — STEP 6', 'Updating lead COMMENTS field', [
         'lead_id' => $entityId,
         'comment' => $commentText,
     ]);
-    respond('success', 'Lead COMMENTS field updated successfully');
-} else {
-    logEvent('STEP 9 — UPDATE LEAD', 'FAILED — Could not update COMMENTS field', $updateResult);
-    respond('error', 'Failed to update lead COMMENTS field');
+
+    $updateResult = callBitrix('crm.lead.update', [
+        'id'               => $entityId,
+        'fields[COMMENTS]' => $commentText,
+    ]);
+
+    if (!isset($updateResult['error'])) {
+        logEvent('DIRECTION B — STEP 6', 'SUCCESS — Lead COMMENTS field updated', [
+            'lead_id' => $entityId,
+            'comment' => $commentText,
+        ]);
+        respond('success', 'Lead COMMENTS field updated successfully');
+    } else {
+        logEvent('DIRECTION B — STEP 6', 'FAILED — Could not update COMMENTS field', $updateResult);
+        respond('error', 'Failed to update lead COMMENTS field');
+    }
 }
+
+respond('ignored', 'No matching handler found');
