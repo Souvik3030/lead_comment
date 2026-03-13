@@ -3,7 +3,7 @@
 // ============================================================
 // CONFIG — update this to your Bitrix24 webhook URL
 // ============================================================
-define('BITRIX_WEBHOOK_URL', 'https://your-domain.bitrix24.com/rest/1/your_webhook_token/');
+define('BITRIX_WEBHOOK_URL', 'https://13.234.18.177.sslip.io/rest/1/c549rd6ic2gw5e3s/');
 define('LOG_FILE',  __DIR__ . '/comments_sync.log');
 define('HASH_DIR',  __DIR__ . '/hashes/'); // stores last synced comment hash per lead
 define('LOCK_DIR',  __DIR__ . '/locks/');  // stores loop guard locks
