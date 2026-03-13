@@ -56,7 +56,7 @@ function callBitrix(string $method, array $params = []): array
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
     $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+    // curl_close($ch);
 
     if ($curlError) {
         logEvent('BITRIX API ERROR', 'cURL error on ' . $method, [
