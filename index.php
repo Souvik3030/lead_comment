@@ -3,10 +3,11 @@
 // ============================================================
 // CONFIG — update this to your Bitrix24 webhook URL
 // ============================================================
-define('BITRIX_WEBHOOK_URL', 'https://13.234.18.177.sslip.io/rest/1/c549rd6ic2gw5e3s/');
+define('BITRIX_WEBHOOK_URL', 'https://your-domain.bitrix24.com/rest/1/your_webhook_token/');
 define('LOG_FILE',  __DIR__ . '/comments_sync.log');
-define('LOCK_DIR',  __DIR__ . '/locks/');
-define('LOCK_TTL',  5); // seconds before lock expires
+define('HASH_DIR',  __DIR__ . '/hashes/'); // stores last synced comment hash per lead
+define('LOCK_DIR',  __DIR__ . '/locks/');  // stores loop guard locks
+define('LOCK_TTL',  10);                   // lock expiry in seconds
 
 // ============================================================
 // HELPERS
@@ -75,18 +76,50 @@ function callBitrix(string $method, array $params = []): array
     return $decoded;
 }
 
+// Save last synced comment hash for a lead+direction
+function saveHash(string $leadId, string $direction, string $comment): void
+{
+    if (!is_dir(HASH_DIR)) mkdir(HASH_DIR, 0755, true);
+    $file = HASH_DIR . 'lead_' . $leadId . '_' . $direction . '.hash';
+    file_put_contents($file, md5($comment));
+    logEvent('HASH SAVED', 'Saved hash for lead', [
+        'lead_id'   => $leadId,
+        'direction' => $direction,
+        'hash'      => md5($comment),
+        'comment'   => $comment,
+    ]);
+}
+
+// Check if this exact comment was already synced from this direction
+function alreadySynced(string $leadId, string $direction, string $comment): bool
+{
+    if (!is_dir(HASH_DIR)) mkdir(HASH_DIR, 0755, true);
+    $file = HASH_DIR . 'lead_' . $leadId . '_' . $direction . '.hash';
+    if (!file_exists($file)) return false;
+    $saved = trim(file_get_contents($file));
+    $current = md5($comment);
+    $isSame = $saved === $current;
+    logEvent('HASH CHECK', 'Checking if already synced', [
+        'lead_id'        => $leadId,
+        'direction'      => $direction,
+        'saved_hash'     => $saved,
+        'current_hash'   => $current,
+        'already_synced' => $isSame,
+    ]);
+    return $isSame;
+}
+
+// Time-based lock to block the immediate echo-back event
 function isLocked(string $leadId, string $direction): bool
 {
-    if (!is_dir(LOCK_DIR)) {
-        mkdir(LOCK_DIR, 0755, true);
-    }
+    if (!is_dir(LOCK_DIR)) mkdir(LOCK_DIR, 0755, true);
     $lockFile = LOCK_DIR . 'lead_' . $leadId . '_' . $direction . '.lock';
     if (file_exists($lockFile) && (time() - filemtime($lockFile)) < LOCK_TTL) {
-        logEvent('LOCK CHECK', 'LOCKED — skipping to prevent infinite loop', [
+        logEvent('LOCK CHECK', 'LOCKED — preventing loop', [
             'lead_id'   => $leadId,
             'direction' => $direction,
-            'lock_file' => $lockFile,
             'age_secs'  => time() - filemtime($lockFile),
+            'ttl'       => LOCK_TTL,
         ]);
         return true;
     }
@@ -95,15 +128,12 @@ function isLocked(string $leadId, string $direction): bool
 
 function setLock(string $leadId, string $direction): void
 {
-    if (!is_dir(LOCK_DIR)) {
-        mkdir(LOCK_DIR, 0755, true);
-    }
+    if (!is_dir(LOCK_DIR)) mkdir(LOCK_DIR, 0755, true);
     $lockFile = LOCK_DIR . 'lead_' . $leadId . '_' . $direction . '.lock';
     file_put_contents($lockFile, time());
-    logEvent('LOCK SET', 'Lock created — will expire in ' . LOCK_TTL . ' seconds', [
+    logEvent('LOCK SET', 'Lock created — expires in ' . LOCK_TTL . 's', [
         'lead_id'   => $leadId,
         'direction' => $direction,
-        'lock_file' => $lockFile,
     ]);
 }
 
@@ -130,7 +160,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     respond('error', 'Only POST requests are allowed');
 }
 
-logEvent('STEP 1 — METHOD CHECK', 'Passed — POST request received');
+logEvent('STEP 1 — METHOD CHECK', 'Passed — POST received');
 
 // ============================================================
 // STEP 2: Read POST data
@@ -140,7 +170,7 @@ $data = $_POST;
 if (empty($data)) {
     $raw  = file_get_contents('php://input');
     $data = json_decode($raw, true) ?? [];
-    logEvent('STEP 2 — POST DATA', '$_POST was empty, tried raw input', [
+    logEvent('STEP 2 — POST DATA', '$_POST empty, tried raw input', [
         'raw'     => $raw,
         'decoded' => $data,
     ]);
@@ -149,7 +179,7 @@ if (empty($data)) {
 }
 
 if (empty($data)) {
-    logEvent('STEP 2 — POST DATA', 'FAILED — no data received at all');
+    logEvent('STEP 2 — POST DATA', 'FAILED — no data at all');
     respond('error', 'No data received');
 }
 
@@ -159,43 +189,38 @@ if (empty($data)) {
 $event         = $data['event'] ?? null;
 $allowedEvents = ['ONCRMLEADADD', 'ONCRMLEADUPDATE', 'ONCRMTIMELINECOMMENTADD'];
 
-logEvent('STEP 3 — EVENT CHECK', 'Checking event type', [
-    'received_event' => $event,
-    'allowed_events' => $allowedEvents,
+logEvent('STEP 3 — EVENT CHECK', 'Checking event', [
+    'received' => $event,
+    'allowed'  => $allowedEvents,
 ]);
 
 if (!$event || !in_array($event, $allowedEvents)) {
-    logEvent('STEP 3 — EVENT CHECK', 'IGNORED — event not in allowed list', ['event' => $event]);
     respond('ignored', 'Unrecognized event: ' . ($event ?? 'none'));
 }
 
-logEvent('STEP 3 — EVENT CHECK', 'Passed — valid event', ['event' => $event]);
+logEvent('STEP 3 — EVENT CHECK', 'Passed', ['event' => $event]);
 
 // ============================================================
-// DIRECTION A: Lead COMMENTS field → Timeline comment
+// DIRECTION A: Lead COMMENTS → Timeline
 // Events: ONCRMLEADADD, ONCRMLEADUPDATE
 // ============================================================
 if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 
     logEvent('DIRECTION A', 'Lead COMMENTS → Timeline triggered', ['event' => $event]);
 
-    // A1: Get Lead ID
     $leadId = $data['data']['FIELDS']['ID'] ?? null;
-    logEvent('DIRECTION A — STEP 1', 'Extracting Lead ID', [
-        'data[data]'   => $data['data'] ?? null,
-        'extracted_id' => $leadId,
-    ]);
+    logEvent('DIRECTION A — STEP 1', 'Extracting Lead ID', ['lead_id' => $leadId]);
 
     if (!$leadId) {
         respond('error', 'Lead ID missing');
     }
 
-    // A2: Loop guard — skip if triggered by our own timeline→comment sync
-    if (isLocked($leadId, 'timeline_to_comment')) {
-        respond('ignored', 'Loop guard — skipping, triggered by our own timeline sync');
+    // Check loop guard — was this ONCRMLEADUPDATE fired by our OWN crm.lead.update (Direction B)?
+    if (isLocked($leadId, 'b_updated_lead')) {
+        respond('ignored', 'Loop guard — this update was triggered by Direction B, skipping');
     }
 
-    // A3: Fetch Lead
+    // Fetch Lead
     logEvent('DIRECTION A — STEP 2', 'Fetching lead', ['lead_id' => $leadId]);
     $leadResult = callBitrix('crm.lead.get', ['id' => $leadId]);
 
@@ -205,17 +230,22 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
     }
 
     $newComment = trim($leadResult['result']['COMMENTS'] ?? '');
+
     logEvent('DIRECTION A — STEP 3', 'COMMENTS field value', [
         'value'    => $newComment,
         'is_empty' => $newComment === '',
     ]);
 
-    // A4: Skip if empty
     if (!$newComment) {
         respond('ignored', 'COMMENTS field is empty — nothing to sync');
     }
 
-    // A5: Fetch latest timeline comment to check for duplicate
+    // Check hash — was this exact comment already synced to timeline?
+    if (alreadySynced($leadId, 'a_comment_to_timeline', $newComment)) {
+        respond('ignored', 'This comment was already synced to timeline — skipping duplicate');
+    }
+
+    // Fetch latest timeline comment as extra safety check
     $timelineResult      = callBitrix('crm.timeline.comment.list', [
         'filter[ENTITY_TYPE]' => 'lead',
         'filter[ENTITY_ID]'   => $leadId,
@@ -224,20 +254,20 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
     ]);
     $lastTimelineComment = trim($timelineResult['result'][0]['COMMENT'] ?? '');
 
-    logEvent('DIRECTION A — STEP 4', 'Duplicate check', [
-        'last_timeline_comment' => $lastTimelineComment,
-        'new_comment'           => $newComment,
-        'is_duplicate'          => $lastTimelineComment === $newComment,
+    logEvent('DIRECTION A — STEP 4', 'Timeline latest comment check', [
+        'last_timeline' => $lastTimelineComment,
+        'new_comment'   => $newComment,
+        'is_duplicate'  => $lastTimelineComment === $newComment,
     ]);
 
     if ($lastTimelineComment === $newComment) {
         respond('ignored', 'Timeline already has this comment — skipping');
     }
 
-    // A6: Set lock before posting to timeline (prevents Direction B from looping back)
-    setLock($leadId, 'comment_to_timeline');
+    // Set lock so Direction B does not echo back when ONCRMTIMELINECOMMENTADD fires
+    setLock($leadId, 'a_posted_timeline');
 
-    // A7: Post to timeline
+    // Post to timeline
     logEvent('DIRECTION A — STEP 5', 'Posting to timeline', [
         'lead_id' => $leadId,
         'comment' => $newComment,
@@ -250,6 +280,8 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
     ]);
 
     if (!empty($addResult['result'])) {
+        // Save hash so we don't re-sync this same comment again
+        saveHash($leadId, 'a_comment_to_timeline', $newComment);
         logEvent('DIRECTION A — STEP 5', 'SUCCESS — Timeline comment created', [
             'lead_id'      => $leadId,
             'comment'      => $newComment,
@@ -270,19 +302,14 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
     logEvent('DIRECTION B', 'Timeline → Lead COMMENTS triggered', ['event' => $event]);
 
-    // B1: Get Comment ID
     $commentId = $data['data']['FIELDS']['ID'] ?? null;
-    logEvent('DIRECTION B — STEP 1', 'Extracting Comment ID', [
-        'data[data]'   => $data['data'] ?? null,
-        'extracted_id' => $commentId,
-    ]);
+    logEvent('DIRECTION B — STEP 1', 'Extracting Comment ID', ['comment_id' => $commentId]);
 
     if (!$commentId) {
         respond('error', 'Comment ID missing');
     }
 
-    // B2: Fetch comment
-    logEvent('DIRECTION B — STEP 2', 'Fetching comment from Bitrix24', ['comment_id' => $commentId]);
+    // Fetch comment
     $commentResult = callBitrix('crm.timeline.comment.get', ['id' => $commentId]);
 
     if (empty($commentResult['result'])) {
@@ -295,32 +322,29 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
     $entityType  = strtolower($commentData['ENTITY_TYPE'] ?? '');
     $entityId    = (int)($commentData['ENTITY_ID'] ?? 0);
 
-    logEvent('DIRECTION B — STEP 3', 'Comment data extracted', [
+    logEvent('DIRECTION B — STEP 3', 'Comment data', [
         'comment_text' => $commentText,
         'entity_type'  => $entityType,
         'entity_id'    => $entityId,
     ]);
 
-    // B3: Validate
-    if ($entityType !== 'lead') {
-        respond('ignored', 'Entity is not a lead — skipping');
-    }
-    if (!$entityId) {
-        respond('error', 'Entity ID missing');
-    }
-    if (!$commentText) {
-        respond('ignored', 'Comment text is empty');
+    if ($entityType !== 'lead') respond('ignored', 'Not a lead entity');
+    if (!$entityId)             respond('error',   'Entity ID missing');
+    if (!$commentText)          respond('ignored', 'Comment text is empty');
+
+    logEvent('DIRECTION B — STEP 3', 'Validation passed');
+
+    // Check loop guard — was this timeline comment posted by our OWN Direction A?
+    if (isLocked($entityId, 'a_posted_timeline')) {
+        respond('ignored', 'Loop guard — this timeline comment was posted by Direction A, skipping');
     }
 
-    logEvent('DIRECTION B — STEP 3', 'Validation passed — valid lead comment');
-
-    // B4: Loop guard — skip if triggered by our own comment→timeline sync
-    if (isLocked($entityId, 'comment_to_timeline')) {
-        respond('ignored', 'Loop guard — skipping, triggered by our own COMMENTS sync');
+    // Check hash — was this exact comment already synced to COMMENTS?
+    if (alreadySynced($entityId, 'b_timeline_to_comment', $commentText)) {
+        respond('ignored', 'This comment was already synced to COMMENTS field — skipping');
     }
 
-    // B5: Fetch current lead COMMENTS
-    logEvent('DIRECTION B — STEP 4', 'Fetching lead to read COMMENTS field', ['lead_id' => $entityId]);
+    // Fetch current lead COMMENTS
     $leadResult = callBitrix('crm.lead.get', ['id' => $entityId]);
 
     if (empty($leadResult['result'])) {
@@ -329,22 +353,22 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
     }
 
     $existingComment = trim($leadResult['result']['COMMENTS'] ?? '');
-    logEvent('DIRECTION B — STEP 5', 'Existing COMMENTS field', [
-        'existing_comment' => $existingComment,
-        'new_comment'      => $commentText,
-        'is_same'          => $existingComment === $commentText,
+
+    logEvent('DIRECTION B — STEP 5', 'COMMENTS field comparison', [
+        'existing' => $existingComment,
+        'new'      => $commentText,
+        'is_same'  => $existingComment === $commentText,
     ]);
 
-    // B6: Skip if already same
     if ($existingComment === $commentText) {
-        respond('ignored', 'COMMENTS already matches timeline comment — skipping');
+        respond('ignored', 'COMMENTS already matches — skipping');
     }
 
-    // B7: Set lock before updating COMMENTS (prevents Direction A from looping back)
-    setLock($entityId, 'timeline_to_comment');
+    // Set lock so Direction A does not echo back when ONCRMLEADUPDATE fires
+    setLock($entityId, 'b_updated_lead');
 
-    // B8: Update COMMENTS field
-    logEvent('DIRECTION B — STEP 6', 'Updating lead COMMENTS field', [
+    // Update COMMENTS
+    logEvent('DIRECTION B — STEP 6', 'Updating lead COMMENTS', [
         'lead_id' => $entityId,
         'comment' => $commentText,
     ]);
@@ -355,15 +379,17 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
     ]);
 
     if (!isset($updateResult['error'])) {
-        logEvent('DIRECTION B — STEP 6', 'SUCCESS — Lead COMMENTS field updated', [
+        // Save hash so we don't re-sync this same comment again
+        saveHash($entityId, 'b_timeline_to_comment', $commentText);
+        logEvent('DIRECTION B — STEP 6', 'SUCCESS — Lead COMMENTS updated', [
             'lead_id' => $entityId,
             'comment' => $commentText,
         ]);
         respond('success', 'Lead COMMENTS field updated successfully');
     } else {
-        logEvent('DIRECTION B — STEP 6', 'FAILED — Could not update COMMENTS field', $updateResult);
+        logEvent('DIRECTION B — STEP 6', 'FAILED — Could not update COMMENTS', $updateResult);
         respond('error', 'Failed to update lead COMMENTS field');
     }
 }
 
-respond('ignored', 'No matching handler found');
+respond('ignored', 'No matching handler');
