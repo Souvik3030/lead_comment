@@ -1,14 +1,13 @@
 <?php
 
 // ============================================================
-// CONFIG
+// CONFIG — update this to your Bitrix24 webhook URL
 // ============================================================
 define('BITRIX_WEBHOOK_URL', 'https://13.234.18.177.sslip.io/rest/1/c549rd6ic2gw5e3s/');
 define('LOG_FILE',  __DIR__ . '/comments_sync.log');
-define('HASH_DIR',  __DIR__ . '/hashes/');
-define('LOCK_DIR',  __DIR__ . '/locks/');
-define('LOCK_TTL',  10);
-define('CUSTOM_FIELD', 'UF_CRM_1773638625565'); // your new multi-select field
+define('HASH_DIR',  __DIR__ . '/hashes/'); // stores last synced comment hash per lead
+define('LOCK_DIR',  __DIR__ . '/locks/');  // stores loop guard locks
+define('LOCK_TTL',  10);                   // lock expiry in seconds
 
 // ============================================================
 // HELPERS
@@ -58,6 +57,7 @@ function callBitrix(string $method, array $params = []): array
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
     $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    // curl_close($ch);
 
     if ($curlError) {
         logEvent('BITRIX API ERROR', 'cURL error on ' . $method, [
@@ -76,6 +76,7 @@ function callBitrix(string $method, array $params = []): array
     return $decoded;
 }
 
+// Save last synced comment hash for a lead+direction
 function saveHash(string $leadId, string $direction, string $comment): void
 {
     if (!is_dir(HASH_DIR)) mkdir(HASH_DIR, 0755, true);
@@ -89,14 +90,15 @@ function saveHash(string $leadId, string $direction, string $comment): void
     ]);
 }
 
+// Check if this exact comment was already synced from this direction
 function alreadySynced(string $leadId, string $direction, string $comment): bool
 {
     if (!is_dir(HASH_DIR)) mkdir(HASH_DIR, 0755, true);
     $file = HASH_DIR . 'lead_' . $leadId . '_' . $direction . '.hash';
     if (!file_exists($file)) return false;
-    $saved   = trim(file_get_contents($file));
+    $saved = trim(file_get_contents($file));
     $current = md5($comment);
-    $isSame  = $saved === $current;
+    $isSame = $saved === $current;
     logEvent('HASH CHECK', 'Checking if already synced', [
         'lead_id'        => $leadId,
         'direction'      => $direction,
@@ -107,6 +109,7 @@ function alreadySynced(string $leadId, string $direction, string $comment): bool
     return $isSame;
 }
 
+// Time-based lock to block the immediate echo-back event
 function isLocked(string $leadId, string $direction): bool
 {
     if (!is_dir(LOCK_DIR)) mkdir(LOCK_DIR, 0755, true);
@@ -132,69 +135,6 @@ function setLock(string $leadId, string $direction): void
         'lead_id'   => $leadId,
         'direction' => $direction,
     ]);
-}
-
-// ============================================================
-// Fetch option ID → label map for the custom field
-// UF_CRM fields store selected values as option IDs (integers)
-// We need to resolve them to human-readable labels
-// ============================================================
-function getFieldOptionLabels(): array
-{
-    $result = callBitrix('crm.lead.fields');
-
-    $fields = $result['result'] ?? [];
-    $field  = $fields[CUSTOM_FIELD] ?? null;
-
-    if (!$field) {
-        logEvent('FIELD OPTIONS', 'FAILED — field not found in crm.lead.fields', [
-            'field' => CUSTOM_FIELD,
-        ]);
-        return [];
-    }
-
-    $map = [];
-    foreach ($field['items'] ?? [] as $item) {
-        $map[(string)$item['ID']] = $item['VALUE'];
-    }
-
-    logEvent('FIELD OPTIONS', 'Resolved option map', [
-        'field' => CUSTOM_FIELD,
-        'map'   => $map,
-    ]);
-
-    return $map;
-}
-
-// Convert array of selected option IDs to comma-separated labels
-// e.g. ["101", "103"] → "Option A, Option C"
-function resolveLabels(array $selectedIds, array $optionMap): string
-{
-    $labels = [];
-    foreach ($selectedIds as $id) {
-        $labels[] = $optionMap[(string)$id] ?? 'Unknown(' . $id . ')';
-    }
-    return implode(', ', $labels);
-}
-
-// Convert comma-separated labels back to array of option IDs
-// e.g. "Option A, Option C" → ["101", "103"]
-function resolveIds(string $labelString, array $optionMap): array
-{
-    $flipped    = array_flip($optionMap); // label → ID
-    $labelParts = array_map('trim', explode(',', $labelString));
-    $ids        = [];
-    foreach ($labelParts as $label) {
-        if (isset($flipped[$label])) {
-            $ids[] = $flipped[$label];
-        } else {
-            logEvent('RESOLVE IDS', 'WARNING — label not found in option map', [
-                'label'      => $label,
-                'option_map' => $optionMap,
-            ]);
-        }
-    }
-    return $ids;
 }
 
 // ============================================================
@@ -261,12 +201,12 @@ if (!$event || !in_array($event, $allowedEvents)) {
 logEvent('STEP 3 — EVENT CHECK', 'Passed', ['event' => $event]);
 
 // ============================================================
-// DIRECTION A: UF_CRM field (multi-select) → Timeline
+// DIRECTION A: Lead COMMENTS → Timeline
 // Events: ONCRMLEADADD, ONCRMLEADUPDATE
 // ============================================================
 if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 
-    logEvent('DIRECTION A', 'UF_CRM field → Timeline triggered', ['event' => $event]);
+    logEvent('DIRECTION A', 'Lead COMMENTS → Timeline triggered', ['event' => $event]);
 
     $leadId = $data['data']['FIELDS']['ID'] ?? null;
     logEvent('DIRECTION A — STEP 1', 'Extracting Lead ID', ['lead_id' => $leadId]);
@@ -275,12 +215,12 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
         respond('error', 'Lead ID missing');
     }
 
-    // Loop guard — was this update triggered by Direction B?
+    // Check loop guard — was this ONCRMLEADUPDATE fired by our OWN crm.lead.update (Direction B)?
     if (isLocked($leadId, 'b_updated_lead')) {
         respond('ignored', 'Loop guard — this update was triggered by Direction B, skipping');
     }
 
-    // Fetch lead
+    // Fetch Lead
     logEvent('DIRECTION A — STEP 2', 'Fetching lead', ['lead_id' => $leadId]);
     $leadResult = callBitrix('crm.lead.get', ['id' => $leadId]);
 
@@ -289,38 +229,23 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
         respond('error', 'Lead not found');
     }
 
-    // UF_CRM multi-select returns an array of selected option IDs
-    $rawValue = $leadResult['result'][CUSTOM_FIELD] ?? [];
+    $newComment = trim($leadResult['result']['COMMENTS'] ?? '');
 
-    // Normalize — could be a single string or an array depending on Bitrix version
-    if (!is_array($rawValue)) {
-        $rawValue = $rawValue ? [$rawValue] : [];
-    }
-
-    logEvent('DIRECTION A — STEP 3', 'Raw UF_CRM field value', [
-        'field'     => CUSTOM_FIELD,
-        'raw_value' => $rawValue,
+    logEvent('DIRECTION A — STEP 3', 'COMMENTS field value', [
+        'value'    => $newComment,
+        'is_empty' => $newComment === '',
     ]);
 
-    if (empty($rawValue)) {
-        respond('ignored', CUSTOM_FIELD . ' is empty — nothing to sync');
+    if (!$newComment) {
+        respond('ignored', 'COMMENTS field is empty — nothing to sync');
     }
 
-    // Resolve option IDs → labels
-    $optionMap    = getFieldOptionLabels();
-    $labelString  = resolveLabels($rawValue, $optionMap);
-
-    logEvent('DIRECTION A — STEP 3', 'Resolved labels', [
-        'selected_ids' => $rawValue,
-        'label_string' => $labelString,
-    ]);
-
-    // Hash check — already synced this exact selection?
-    if (alreadySynced($leadId, 'a_comment_to_timeline', $labelString)) {
-        respond('ignored', 'This selection was already synced to timeline — skipping duplicate');
+    // Check hash — was this exact comment already synced to timeline?
+    if (alreadySynced($leadId, 'a_comment_to_timeline', $newComment)) {
+        respond('ignored', 'This comment was already synced to timeline — skipping duplicate');
     }
 
-    // Check latest timeline comment
+    // Fetch latest timeline comment as extra safety check
     $timelineResult      = callBitrix('crm.timeline.comment.list', [
         'filter[ENTITY_TYPE]' => 'lead',
         'filter[ENTITY_ID]'   => $leadId,
@@ -331,34 +256,35 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 
     logEvent('DIRECTION A — STEP 4', 'Timeline latest comment check', [
         'last_timeline' => $lastTimelineComment,
-        'new_value'     => $labelString,
-        'is_duplicate'  => $lastTimelineComment === $labelString,
+        'new_comment'   => $newComment,
+        'is_duplicate'  => $lastTimelineComment === $newComment,
     ]);
 
-    if ($lastTimelineComment === $labelString) {
-        respond('ignored', 'Timeline already has this value — skipping');
+    if ($lastTimelineComment === $newComment) {
+        respond('ignored', 'Timeline already has this comment — skipping');
     }
 
-    // Set lock so Direction B does not echo back
+    // Set lock so Direction B does not echo back when ONCRMTIMELINECOMMENTADD fires
     setLock($leadId, 'a_posted_timeline');
 
     // Post to timeline
     logEvent('DIRECTION A — STEP 5', 'Posting to timeline', [
-        'lead_id'      => $leadId,
-        'label_string' => $labelString,
+        'lead_id' => $leadId,
+        'comment' => $newComment,
     ]);
 
     $addResult = callBitrix('crm.timeline.comment.add', [
         'fields[ENTITY_TYPE]' => 'lead',
         'fields[ENTITY_ID]'   => $leadId,
-        'fields[COMMENT]'     => $labelString,
+        'fields[COMMENT]'     => $newComment,
     ]);
 
     if (!empty($addResult['result'])) {
-        saveHash($leadId, 'a_comment_to_timeline', $labelString);
+        // Save hash so we don't re-sync this same comment again
+        saveHash($leadId, 'a_comment_to_timeline', $newComment);
         logEvent('DIRECTION A — STEP 5', 'SUCCESS — Timeline comment created', [
             'lead_id'      => $leadId,
-            'label_string' => $labelString,
+            'comment'      => $newComment,
             'new_entry_id' => $addResult['result'],
         ]);
         respond('success', 'Timeline comment created successfully');
@@ -369,12 +295,12 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 }
 
 // ============================================================
-// DIRECTION B: Timeline comment → UF_CRM field (multi-select)
+// DIRECTION B: Timeline comment → Lead COMMENTS field
 // Event: ONCRMTIMELINECOMMENTADD
 // ============================================================
 if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
-    logEvent('DIRECTION B', 'Timeline → UF_CRM field triggered', ['event' => $event]);
+    logEvent('DIRECTION B', 'Timeline → Lead COMMENTS triggered', ['event' => $event]);
 
     $commentId = $data['data']['FIELDS']['ID'] ?? null;
     logEvent('DIRECTION B — STEP 1', 'Extracting Comment ID', ['comment_id' => $commentId]);
@@ -408,85 +334,61 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
     logEvent('DIRECTION B — STEP 3', 'Validation passed');
 
-    // Loop guard — was this timeline comment posted by Direction A?
+    // Check loop guard — was this timeline comment posted by our OWN Direction A?
     if (isLocked($entityId, 'a_posted_timeline')) {
         respond('ignored', 'Loop guard — this timeline comment was posted by Direction A, skipping');
     }
 
-    // Hash check
+    // Check hash — was this exact comment already synced to COMMENTS?
     if (alreadySynced($entityId, 'b_timeline_to_comment', $commentText)) {
-        respond('ignored', 'This comment was already synced to UF_CRM field — skipping');
+        respond('ignored', 'This comment was already synced to COMMENTS field — skipping');
     }
 
-    // Resolve labels → option IDs
-    $optionMap   = getFieldOptionLabels();
-    $selectedIds = resolveIds($commentText, $optionMap);
-
-    logEvent('DIRECTION B — STEP 4', 'Resolved option IDs from labels', [
-        'comment_text' => $commentText,
-        'selected_ids' => $selectedIds,
-    ]);
-
-    if (empty($selectedIds)) {
-        respond('ignored', 'No valid option labels found in comment — skipping');
-    }
-
-    // Fetch current UF_CRM field value
+    // Fetch current lead COMMENTS
     $leadResult = callBitrix('crm.lead.get', ['id' => $entityId]);
 
     if (empty($leadResult['result'])) {
-        logEvent('DIRECTION B — STEP 5', 'FAILED — Lead not found', $leadResult);
+        logEvent('DIRECTION B — STEP 4', 'FAILED — Lead not found', $leadResult);
         respond('error', 'Lead not found');
     }
 
-    $existingRaw = $leadResult['result'][CUSTOM_FIELD] ?? [];
-    if (!is_array($existingRaw)) {
-        $existingRaw = $existingRaw ? [$existingRaw] : [];
-    }
+    $existingComment = trim($leadResult['result']['COMMENTS'] ?? '');
 
-    // Compare as sorted arrays so order doesn't matter
-    $existingSorted = $existingRaw;
-    $newSorted      = $selectedIds;
-    sort($existingSorted);
-    sort($newSorted);
-
-    logEvent('DIRECTION B — STEP 5', 'UF_CRM field comparison', [
-        'existing_ids' => $existingSorted,
-        'new_ids'      => $newSorted,
-        'is_same'      => $existingSorted === $newSorted,
+    logEvent('DIRECTION B — STEP 5', 'COMMENTS field comparison', [
+        'existing' => $existingComment,
+        'new'      => $commentText,
+        'is_same'  => $existingComment === $commentText,
     ]);
 
-    if ($existingSorted === $newSorted) {
-        respond('ignored', 'UF_CRM field already matches — skipping');
+    if ($existingComment === $commentText) {
+        respond('ignored', 'COMMENTS already matches — skipping');
     }
 
-    // Set lock so Direction A does not echo back
+    // Set lock so Direction A does not echo back when ONCRMLEADUPDATE fires
     setLock($entityId, 'b_updated_lead');
 
-    // Build params for multi-select — Bitrix expects array notation
-    $params = ['id' => $entityId];
-    foreach ($selectedIds as $index => $id) {
-        $params['fields[' . CUSTOM_FIELD . '][' . $index . ']'] = $id;
-    }
-
-    logEvent('DIRECTION B — STEP 6', 'Updating UF_CRM field', [
-        'lead_id'      => $entityId,
-        'selected_ids' => $selectedIds,
-        'params'       => $params,
+    // Update COMMENTS
+    logEvent('DIRECTION B — STEP 6', 'Updating lead COMMENTS', [
+        'lead_id' => $entityId,
+        'comment' => $commentText,
     ]);
 
-    $updateResult = callBitrix('crm.lead.update', $params);
+    $updateResult = callBitrix('crm.lead.update', [
+        'id'               => $entityId,
+        'fields[COMMENTS]' => $commentText,
+    ]);
 
     if (!isset($updateResult['error'])) {
+        // Save hash so we don't re-sync this same comment again
         saveHash($entityId, 'b_timeline_to_comment', $commentText);
-        logEvent('DIRECTION B — STEP 6', 'SUCCESS — UF_CRM field updated', [
-            'lead_id'      => $entityId,
-            'selected_ids' => $selectedIds,
+        logEvent('DIRECTION B — STEP 6', 'SUCCESS — Lead COMMENTS updated', [
+            'lead_id' => $entityId,
+            'comment' => $commentText,
         ]);
-        respond('success', 'UF_CRM field updated successfully');
+        respond('success', 'Lead COMMENTS field updated successfully');
     } else {
-        logEvent('DIRECTION B — STEP 6', 'FAILED — Could not update UF_CRM field', $updateResult);
-        respond('error', 'Failed to update UF_CRM field');
+        logEvent('DIRECTION B — STEP 6', 'FAILED — Could not update COMMENTS', $updateResult);
+        respond('error', 'Failed to update lead COMMENTS field');
     }
 }
 
