@@ -1,6 +1,6 @@
 <?php
 
-define('BITRIX_WEBHOOK_URL', 'https://13.234.18.177.sslip.io/rest/1/c549rd6ic2gw5e3s/');
+define('BITRIX_WEBHOOK_URL', 'https://test.vortexwebre.com/rest/1/s2avv4lnmgmi8xor/');
 define('LOG_FILE',  __DIR__ . '/comments_sync.log');
 define('HASH_DIR',  __DIR__ . '/hashes/');
 define('LOCK_DIR',  __DIR__ . '/locks/');
