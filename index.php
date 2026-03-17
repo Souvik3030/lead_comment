@@ -1,13 +1,15 @@
 <?php
 
 // ============================================================
-// CONFIG — update these values
+// CONFIG — update these values (Change only webhook url and custom field ID 'UF_CRM_...')
 // ============================================================
-define('BITRIX_WEBHOOK_URL', 'https://test.vortexwebre.com/rest/1/s2avv4lnmgmi8xor/');
 define('LOG_FILE',  __DIR__ . '/comments_sync.log');
 define('HASH_DIR',  __DIR__ . '/hashes/');
 define('LOCK_DIR',  __DIR__ . '/locks/');
 define('LOCK_TTL',  10);
+
+// ONLY CONFIGURE THIS
+define('BITRIX_WEBHOOK_URL', 'https://test.vortexwebre.com/rest/1/s2avv4lnmgmi8xor/'); // <- Inbound webhook
 define('CUSTOM_FIELD', 'UF_CRM_1773728226354');
 
 // ============================================================
@@ -58,7 +60,6 @@ function callBitrix(string $method, array $params = []): array
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
     $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    // curl_close($ch);
 
     if ($curlError) {
         logEvent('BITRIX API ERROR', 'cURL error on ' . $method, [
