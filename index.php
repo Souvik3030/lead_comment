@@ -5,7 +5,7 @@ define('LOG_FILE',  __DIR__ . '/comments_sync.log');
 define('HASH_DIR',  __DIR__ . '/hashes/');
 define('LOCK_DIR',  __DIR__ . '/locks/');
 define('LOCK_TTL',  10);
-define('CUSTOM_FIELD', 'UF_CRM_1773638625565');
+define('CUSTOM_FIELD', 'UF_CRM_1773728226354');
 
 
 function logEvent(string $step, string $message, $context = null): void
