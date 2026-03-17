@@ -84,13 +84,6 @@ function arrayToTimeline(array $values): string
     return implode("\n", array_filter(array_map('trim', $values)));
 }
 
-// Convert timeline string → array of text values
-// "val1\nval2\nval3" → ["val1", "val2", "val3"]
-function timelineToArray(string $text): array
-{
-    return array_values(array_filter(array_map('trim', explode("\n", $text))));
-}
-
 function saveHash(string $leadId, string $direction, string $value): void
 {
     if (!is_dir(HASH_DIR)) mkdir(HASH_DIR, 0755, true);
@@ -281,7 +274,7 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
         respond('error', 'Lead not found');
     }
 
-    // A4: Read UF_CRM multiple value field — returns array of strings
+    // A4: Read UF_CRM multiple value field
     $rawValue = $leadResult['result'][CUSTOM_FIELD] ?? [];
     if (!is_array($rawValue)) {
         $rawValue = $rawValue !== '' ? [$rawValue] : [];
@@ -306,12 +299,12 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
         'timeline_text' => $timelineText,
     ]);
 
-    // A6: Hash check — already synced this exact value?
+    // A6: Hash check
     if (alreadySynced($leadId, 'a_field_to_timeline', $timelineText)) {
         respond('ignored', 'Already synced these values to timeline — skipping duplicate');
     }
 
-    // A7: Check latest timeline comment to prevent duplicate
+    // A7: Check latest timeline comment
     $timelineResult      = callBitrix('crm.timeline.comment.list', [
         'filter[ENTITY_TYPE]' => 'lead',
         'filter[ENTITY_ID]'   => $leadId,
@@ -348,9 +341,9 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
     if (!empty($addResult['result'])) {
         saveHash($leadId, 'a_field_to_timeline', $timelineText);
         logEvent('DIRECTION A — STEP 7', '★ SUCCESS — Timeline comment created', [
-            'lead_id'      => $leadId,
-            'timeline_text'=> $timelineText,
-            'new_entry_id' => $addResult['result'],
+            'lead_id'       => $leadId,
+            'timeline_text' => $timelineText,
+            'new_entry_id'  => $addResult['result'],
         ]);
         respond('success', 'Timeline comment created successfully');
     } else {
@@ -360,12 +353,13 @@ if (in_array($event, ['ONCRMLEADADD', 'ONCRMLEADUPDATE'])) {
 }
 
 // ============================================================
-// DIRECTION B: Timeline comment → UF_CRM multiple text field
+// DIRECTION B: Timeline comment → APPEND to UF_CRM multiple field
 // Event: ONCRMTIMELINECOMMENTADD
+// NOTE: This APPENDS the new comment as a new value — does NOT replace existing values
 // ============================================================
 if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
-    logEvent('DIRECTION B — ENTRY', '★ Timeline → UF_CRM field triggered', [
+    logEvent('DIRECTION B — ENTRY', '★ Timeline → UF_CRM field (APPEND) triggered', [
         'event'    => $event,
         'raw_data' => $data,
     ]);
@@ -407,7 +401,7 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
 
     logEvent('DIRECTION B — STEP 3', 'Validation passed');
 
-    // B3: Loop guard check
+    // B3: Loop guard check — was this posted by Direction A?
     logEvent('DIRECTION B — STEP 4', 'Checking loop guard', [
         'lead_id'  => $entityId,
         'lock_age' => getLockAge($entityId, 'a_posted_timeline') !== null
@@ -420,80 +414,74 @@ if ($event === 'ONCRMTIMELINECOMMENTADD') {
         respond('ignored', 'Loop guard — comment was posted by Direction A, skipping');
     }
 
-    // B4: Hash check
+    // B4: Hash check — was this exact comment already appended?
     if (alreadySynced($entityId, 'b_timeline_to_field', $commentText)) {
-        respond('ignored', 'Already synced this comment to UF_CRM field — skipping');
+        respond('ignored', 'Already appended this comment to UF_CRM field — skipping');
     }
 
-    // B5: Convert timeline string → array of values
-    // "val1\nval2\nval3" → ["val1", "val2", "val3"]
-    $newValues = timelineToArray($commentText);
-
-    logEvent('DIRECTION B — STEP 5', 'Converted timeline to array', [
-        'comment_text' => $commentText,
-        'new_values'   => $newValues,
-    ]);
-
-    if (empty($newValues)) {
-        respond('ignored', 'No values found in comment — skipping');
-    }
-
-    // B6: Fetch current UF_CRM field value
-    logEvent('DIRECTION B — STEP 6', 'Fetching current lead UF_CRM field', ['lead_id' => $entityId]);
+    // B5: Fetch current UF_CRM field values
+    logEvent('DIRECTION B — STEP 5', 'Fetching current lead UF_CRM values', ['lead_id' => $entityId]);
     $leadResult = callBitrix('crm.lead.get', ['id' => $entityId]);
 
     if (empty($leadResult['result'])) {
-        logEvent('DIRECTION B — STEP 6', 'FAILED — Lead not found', $leadResult);
+        logEvent('DIRECTION B — STEP 5', 'FAILED — Lead not found', $leadResult);
         respond('error', 'Lead not found');
     }
 
-    $existingRaw = $leadResult['result'][CUSTOM_FIELD] ?? [];
-    if (!is_array($existingRaw)) {
-        $existingRaw = $existingRaw !== '' ? [$existingRaw] : [];
+    $existingValues = $leadResult['result'][CUSTOM_FIELD] ?? [];
+    if (!is_array($existingValues)) {
+        $existingValues = $existingValues !== '' ? [$existingValues] : [];
     }
-    $existingRaw = array_values(array_filter(array_map('trim', $existingRaw)));
+    $existingValues = array_values(array_filter(array_map('trim', $existingValues)));
 
-    // Compare sorted arrays — order doesn't matter
-    $existingSorted = $existingRaw;
-    $newSorted      = $newValues;
-    sort($existingSorted);
-    sort($newSorted);
-
-    logEvent('DIRECTION B — STEP 7', 'UF_CRM field comparison', [
-        'existing_values' => $existingSorted,
-        'new_values'      => $newSorted,
-        'is_same'         => $existingSorted === $newSorted,
+    logEvent('DIRECTION B — STEP 6', 'Current UF_CRM field values', [
+        'existing_values' => $existingValues,
+        'new_comment'     => $commentText,
     ]);
 
-    if ($existingSorted === $newSorted) {
-        respond('ignored', 'UF_CRM field already matches — skipping');
+    // B6: Check if this comment already exists in the field values — skip if duplicate
+    if (in_array($commentText, $existingValues)) {
+        logEvent('DIRECTION B — STEP 6', 'IGNORED — comment already exists in UF_CRM field', [
+            'comment'         => $commentText,
+            'existing_values' => $existingValues,
+        ]);
+        respond('ignored', 'Comment already exists in UF_CRM field — skipping');
     }
 
-    // B7: Set lock so Direction A does not echo back
+    // B7: APPEND new comment to existing values
+    $updatedValues = array_merge($existingValues, [$commentText]);
+
+    logEvent('DIRECTION B — STEP 7', 'Appending new comment to field', [
+        'existing_values' => $existingValues,
+        'appended_value'  => $commentText,
+        'updated_values'  => $updatedValues,
+    ]);
+
+    // B8: Set lock so Direction A does not echo back
     setLock($entityId, 'b_updated_lead');
 
-    // B8: Update UF_CRM multiple field
-    // Bitrix24 expects array notation: fields[UF_CRM_xxx][0]=val1&fields[UF_CRM_xxx][1]=val2
+    // B9: Update UF_CRM multiple field with all values (existing + new)
     $params = ['id' => $entityId];
-    foreach ($newValues as $index => $value) {
+    foreach ($updatedValues as $index => $value) {
         $params['fields[' . CUSTOM_FIELD . '][' . $index . ']'] = $value;
     }
 
-    logEvent('DIRECTION B — STEP 8', 'Updating UF_CRM field', [
-        'lead_id'    => $entityId,
-        'new_values' => $newValues,
-        'params'     => $params,
+    logEvent('DIRECTION B — STEP 8', 'Updating UF_CRM field with appended values', [
+        'lead_id'        => $entityId,
+        'updated_values' => $updatedValues,
+        'params'         => $params,
     ]);
 
     $updateResult = callBitrix('crm.lead.update', $params);
 
     if (!isset($updateResult['error'])) {
         saveHash($entityId, 'b_timeline_to_field', $commentText);
-        logEvent('DIRECTION B — STEP 8', '★ SUCCESS — UF_CRM field updated', [
-            'lead_id'    => $entityId,
-            'new_values' => $newValues,
+        logEvent('DIRECTION B — STEP 8', '★ SUCCESS — Comment appended to UF_CRM field', [
+            'lead_id'        => $entityId,
+            'appended_value' => $commentText,
+            'updated_values' => $updatedValues,
         ]);
-        respond('success', 'UF_CRM field updated successfully');
+        respond('success', 'Comment appended to UF_CRM field successfully');
     } else {
         logEvent('DIRECTION B — STEP 8', 'FAILED — Could not update UF_CRM field', $updateResult);
         respond('error', 'Failed to update UF_CRM field');
